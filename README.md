@@ -36,3 +36,15 @@ Distribuye `SmartSouthTray.exe` a las PC. Para actualizar la aplicación no hace
 El ZIP debe contener `SmartSouthTray.ps1`, `Logo.png` y `version.txt` en la raíz (el script de empaquetado lo prepara así). El repositorio debe ser público y tener al menos un Release publicado para que las PC puedan descargarlo sin credenciales ni tokens.
 
 Las versiones instaladas se conservan en carpetas separadas para no reemplazar archivos que otra instancia del programa pueda estar utilizando.
+
+## Vigencia según GLPI-Agent
+
+Al iniciar SmartSouthTray, se registra una tarea del usuario actual en el Programador de tareas. La tarea comprueba cada hora el servicio de Windows `glpi-agent` y vuelve a comprobarlo al iniciar sesión:
+
+- Si el servicio está en ejecución, se reinicia el período de gracia.
+- Si está detenido o no está instalado, comienza un período de 15 días.
+- Si continúa detenido al vencer ese plazo, se cierran únicamente las instancias de SmartSouthTray de ese usuario, se elimina la tarea y se borra `%LOCALAPPDATA%\SmartSouthTray`.
+
+La comprobación no requiere privilegios de administrador. Si Windows no permite consultar el estado del servicio, la tarea registra el error y no avanza la desinstalación. Si el equipo está apagado, el plazo transcurre igualmente y se aplica en la siguiente comprobación al volver a iniciar sesión.
+
+La tarea y el estado de la política se configuran para la cuenta de Windows que ejecuta SmartSouthTray. La desinstalación elimina los datos de esa cuenta; no elimina el ejecutable bootstrapper si fue guardado en otra ubicación. Tras la baja, un técnico puede volver a ejecutar manualmente `SmartSouthTray.exe` cuando corresponda.

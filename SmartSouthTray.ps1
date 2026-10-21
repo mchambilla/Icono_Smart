@@ -1,4 +1,8 @@
 ﻿#Requires -Version 5.0
+param(
+    [switch]$MonitorOnly
+)
+
 # SmartSouth Tray Icon - Info del equipo
 # Creado por: Martin Chambilla
 
@@ -10,9 +14,171 @@ $SoporteMail  = "ayuda@smartsouth.net"
 $SoportePhone = "+54 9 11 6794-7386"
 $AppTitle     = "Smart South - Soporte IT"
 $ColorHeader  = [System.Drawing.Color]::FromArgb(24, 81, 163)
-$IconPath     = Join-Path $PSScriptRoot "logo.ico"
-$PngPath      = Join-Path $PSScriptRoot "Logo.png"
+$IconPath     = "C:\SmartSouth\logo.ico"
+$PngPath      = "C:\SmartSouth\logo.png"
+$GlpiService  = "glpi-agent"
+$GracePeriodDays = 15
+$MonitorTaskPrefix = "SmartSouthTray GLPI Agent Monitor"
 # ─────────────────────────────────────────────────────────────────────────────
+
+function Get-ManagedAppRoot {
+    $localAppRoot = [System.IO.Path]::GetFullPath(
+        (Join-Path $env:LOCALAPPDATA "SmartSouthTray")
+    )
+    $versionsRoot = Join-Path $localAppRoot "versions"
+    $scriptDirectory = [System.IO.Path]::GetFullPath($PSScriptRoot)
+
+    if (-not [string]::Equals(
+        (Split-Path -Parent $scriptDirectory),
+        $versionsRoot,
+        [System.StringComparison]::OrdinalIgnoreCase
+    )) {
+        return $null
+    }
+
+    return $localAppRoot
+}
+
+function Get-MonitorTaskName {
+    $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+    return "$MonitorTaskPrefix - $($identity.User.Value)"
+}
+
+function Write-MonitorLog {
+    param([string]$Message)
+
+    $logPath = Join-Path $script:ManagedAppRoot "monitor.log"
+    $line = "{0} {1}" -f [DateTime]::UtcNow.ToString("o"), $Message
+    Add-Content -LiteralPath $logPath -Value $line -Encoding UTF8 -ErrorAction Stop
+}
+
+function Register-MonitorTask {
+    if (-not $script:ManagedAppRoot) {
+        throw "La política de desinstalación requiere instalar SmartSouthTray con el bootstrapper en %LOCALAPPDATA%\SmartSouthTray."
+    }
+
+    $currentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+    $taskName = Get-MonitorTaskName
+    $powershellPath = Join-Path $env:WINDIR "System32\WindowsPowerShell\v1.0\powershell.exe"
+    $scriptPath = Join-Path $PSScriptRoot "SmartSouthTray.ps1"
+    $arguments = "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$scriptPath`" -MonitorOnly"
+
+    $action = New-ScheduledTaskAction -Execute $powershellPath -Argument $arguments
+    $trigger = New-ScheduledTaskTrigger -AtLogOn -User $currentUser
+    $principal = New-ScheduledTaskPrincipal -UserId $currentUser -LogonType Interactive -RunLevel Limited
+    $settings = New-ScheduledTaskSettingsSet `
+        -ExecutionTimeLimit ([TimeSpan]::Zero) `
+        -MultipleInstances IgnoreNew `
+        -StartWhenAvailable `
+        -RestartCount 3 `
+        -RestartInterval (New-TimeSpan -Minutes 5)
+
+    Register-ScheduledTask `
+        -TaskName $taskName `
+        -Action $action `
+        -Trigger $trigger `
+        -Principal $principal `
+        -Settings $settings `
+        -Description "Controla el servicio GLPI-Agent y la vigencia de SmartSouthTray." `
+        -Force `
+        -ErrorAction Stop | Out-Null
+
+    $task = Get-ScheduledTask -TaskName $taskName -ErrorAction Stop
+    if ($task.State -ne "Running") {
+        Start-ScheduledTask -TaskName $taskName -ErrorAction Stop
+    }
+}
+
+function Invoke-MonitorCheck {
+    $statePath = Join-Path $script:ManagedAppRoot "glpi-agent-stopped-since.txt"
+    $service = Get-CimInstance `
+        -ClassName Win32_Service `
+        -Filter "Name='$GlpiService'" `
+        -ErrorAction Stop
+
+    if ($service -and $service.State -eq "Running") {
+        if (Test-Path -LiteralPath $statePath) {
+            Remove-Item -LiteralPath $statePath -Force -ErrorAction Stop
+            Write-MonitorLog "GLPI-Agent está en ejecución; se reinició el período de gracia."
+        }
+        return $false
+    }
+
+    if (-not (Test-Path -LiteralPath $statePath)) {
+        [DateTime]::UtcNow.ToString("o") |
+            Set-Content -LiteralPath $statePath -Encoding ASCII -ErrorAction Stop
+        Write-MonitorLog "GLPI-Agent está detenido o no instalado; comenzó el período de gracia de $GracePeriodDays días."
+        return $false
+    }
+
+    $stoppedSinceText = Get-Content -LiteralPath $statePath -Raw -ErrorAction Stop
+    try {
+        $stoppedSince = [DateTime]::Parse(
+            $stoppedSinceText.Trim(),
+            [System.Globalization.CultureInfo]::InvariantCulture,
+            [System.Globalization.DateTimeStyles]::RoundtripKind
+        ).ToUniversalTime()
+    } catch {
+        [DateTime]::UtcNow.ToString("o") |
+            Set-Content -LiteralPath $statePath -Encoding ASCII -ErrorAction Stop
+        Write-MonitorLog "El registro del período de gracia no era válido; se inició uno nuevo de $GracePeriodDays días."
+        return $false
+    }
+    $elapsed = [DateTime]::UtcNow - $stoppedSince
+
+    if ($elapsed.TotalDays -ge $GracePeriodDays) {
+        Write-MonitorLog "GLPI-Agent lleva detenido al menos $GracePeriodDays días; se inicia la desinstalación."
+        return $true
+    }
+
+    return $false
+}
+
+function Uninstall-SmartSouthTray {
+    $versionsRoot = Join-Path $script:ManagedAppRoot "versions"
+    $scriptPattern = '(?i)-File\s+"?' +
+        [regex]::Escape($versionsRoot) +
+        '\\[^"]+\\SmartSouthTray\.ps1'
+
+    $processes = Get-CimInstance -ClassName Win32_Process -ErrorAction Stop |
+        Where-Object {
+            $_.ProcessId -ne $PID -and
+            $_.Name -in @("powershell.exe", "pwsh.exe") -and
+            $_.CommandLine -and
+            $_.CommandLine -match $scriptPattern
+        }
+
+    foreach ($process in $processes) {
+        Stop-Process -Id $process.ProcessId -Force -ErrorAction Stop
+    }
+
+    Unregister-ScheduledTask -TaskName (Get-MonitorTaskName) -Confirm:$false -ErrorAction Stop
+    Remove-Item -LiteralPath $script:ManagedAppRoot -Recurse -Force -ErrorAction Stop
+}
+
+function Start-MonitorLoop {
+    while ($true) {
+        try {
+            if (Invoke-MonitorCheck) {
+                Uninstall-SmartSouthTray
+                return
+            }
+        } catch {
+            Write-MonitorLog "Error al comprobar el servicio o aplicar la política: $($_.Exception.Message)"
+        }
+
+        Start-Sleep -Seconds 3600
+    }
+}
+
+$script:ManagedAppRoot = Get-ManagedAppRoot
+if ($MonitorOnly) {
+    if (-not $script:ManagedAppRoot) {
+        exit 1
+    }
+    Start-MonitorLoop
+    exit 0
+}
 
 # ─── OBTENER INFO DEL EQUIPO ─────────────────────────────────────────────────
 function Get-EquipoInfo {
@@ -21,13 +187,22 @@ function Get-EquipoInfo {
     $info.HostName = $env:COMPUTERNAME
     $info.Usuario  = $env:USERNAME
 
+    # Días sin reiniciar (Uptime)
+    try {
+        $lastBoot = (Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop).LastBootUpTime
+        $uptime = (Get-Date) - $lastBoot
+        $info.DiasSinReiniciar = [int][math]::Floor($uptime.TotalDays)
+    } catch {
+        $info.DiasSinReiniciar = "N/A"
+    }
+
     # IP Local
     $info.IP = (Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
         Where-Object { $_.IPAddress -notlike '127.*' -and $_.IPAddress -notlike '169.254.*' } |
         Select-Object -First 1).IPAddress
     if (-not $info.IP) { $info.IP = "No disponible" }
 
-    # IP Pública (Timeout 2s)
+    # IP Pública
     try {
         $webRequest = [System.Net.WebRequest]::Create("https://ifconfig.me/ip")
         $webRequest.Timeout = 2000
@@ -59,6 +234,17 @@ function Get-EquipoInfo {
     return $info
 }
 
+try {
+    Register-MonitorTask
+} catch {
+    [System.Windows.Forms.MessageBox]::Show(
+        "No se pudo activar el control de GLPI-Agent. SmartSouthTray continuará abierto, pero no podrá aplicar la desinstalación automática.`r`n`r`n$($_.Exception.Message)",
+        "Smart South - Control de soporte",
+        [System.Windows.Forms.MessageBoxButtons]::OK,
+        [System.Windows.Forms.MessageBoxIcon]::Warning
+    ) | Out-Null
+}
+
 # ─── CARGAR O GENERAR ICONO ─────────────────────────────────────────────────
 function Get-SmartIcon {
     if (Test-Path $IconPath) {
@@ -68,7 +254,6 @@ function Get-SmartIcon {
         $hIcon = $bmp.GetHicon()
         return [System.Drawing.Icon]::FromHandle($hIcon)
     } else {
-        # Respaldo si no encuentra el archivo de imagen
         $bmp = New-Object System.Drawing.Bitmap 16, 16
         $g   = [System.Drawing.Graphics]::FromImage($bmp)
         $brush = New-Object System.Drawing.SolidBrush ($ColorHeader)
@@ -84,127 +269,225 @@ function Show-InfoPopup {
 
     $form = New-Object System.Windows.Forms.Form
     $form.Text            = $AppTitle
-    $form.Size            = New-Object System.Drawing.Size(320, 440)
     $form.StartPosition   = [System.Windows.Forms.FormStartPosition]::Manual
-    $form.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::FixedSingle
+    $form.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::FixedToolWindow
     $form.MaximizeBox     = $false
     $form.MinimizeBox     = $false
     $form.TopMost         = $true
-    $form.BackColor       = [System.Drawing.Color]::White
+    $form.BackColor       = [System.Drawing.Color]::FromArgb(244, 246, 250)
+    $form.ClientSize      = New-Object System.Drawing.Size(380, 470)
     $form.Font            = New-Object System.Drawing.Font("Segoe UI", 9)
 
     $screen = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
-    $form.Location = New-Object System.Drawing.Point(
-        ($screen.Right  - $form.Width  - 10),
-        ($screen.Bottom - $form.Height - 10)
-    )
 
-    # Header
     $header = New-Object System.Windows.Forms.Panel
-    $header.Size     = New-Object System.Drawing.Size(320, 40)
+    $header.Size     = New-Object System.Drawing.Size(380, 60)
     $header.Location = New-Object System.Drawing.Point(0, 0)
     $header.BackColor = $ColorHeader
 
     $lblTitle = New-Object System.Windows.Forms.Label
-    $lblTitle.Text      = "  Smart South - Info del equipo"
+    $lblTitle.Text      = "Smart South"
     $lblTitle.ForeColor = [System.Drawing.Color]::White
-    $lblTitle.Font      = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Bold)
-    $lblTitle.AutoSize  = $false
-    $lblTitle.Size      = New-Object System.Drawing.Size(320, 40)
-    $lblTitle.TextAlign = [System.Drawing.ContentAlignment]::MiddleLeft
+    $lblTitle.Font      = New-Object System.Drawing.Font("Segoe UI", 12, [System.Drawing.FontStyle]::Bold)
+    $lblTitle.Location  = New-Object System.Drawing.Point(20, 8)
+    $lblTitle.AutoSize  = $true
     $header.Controls.Add($lblTitle)
+
+    $lblSubtitle = New-Object System.Windows.Forms.Label
+    $lblSubtitle.Text      = "Resumen del dispositivo"
+    $lblSubtitle.ForeColor = [System.Drawing.Color]::FromArgb(220, 232, 248)
+    $lblSubtitle.Font      = New-Object System.Drawing.Font("Segoe UI", 8.5)
+    $lblSubtitle.Location  = New-Object System.Drawing.Point(21, 34)
+    $lblSubtitle.AutoSize  = $true
+    $header.Controls.Add($lblSubtitle)
     $form.Controls.Add($header)
 
-    $script:currentY = 55
+    $accentColor = [System.Drawing.Color]::FromArgb(24, 81, 163)
+    $textColor = [System.Drawing.Color]::FromArgb(35, 45, 60)
+    $mutedColor = [System.Drawing.Color]::FromArgb(115, 125, 140)
+    $cardColor = [System.Drawing.Color]::White
+    $currentY = 76
 
-    function Add-Row {
-        param($label, $value, $isLink = $false, $isPhone = $false)
-
-        $lbl = New-Object System.Windows.Forms.Label
-        $lbl.Text      = $label
-        $lbl.Font      = New-Object System.Drawing.Font("Segoe UI", 8)
-        $lbl.ForeColor = [System.Drawing.Color]::FromArgb(120, 120, 120)
-        $lbl.Location  = New-Object System.Drawing.Point(20, $script:currentY)
-        $lbl.AutoSize  = $true
-        $form.Controls.Add($lbl)
-
-        if ($isLink) {
-            $ctrl = New-Object System.Windows.Forms.LinkLabel
-            $ctrl.Text      = $value
-            $ctrl.Font      = New-Object System.Drawing.Font("Segoe UI", 9.5, [System.Drawing.FontStyle]::Regular)
-            $ctrl.LinkColor = [System.Drawing.Color]::FromArgb(24, 81, 163)
-            $ctrl.Location  = New-Object System.Drawing.Point(20, ($script:currentY + 15))
-            $ctrl.AutoSize  = $true
-            
-            if ($isPhone) {
-                $ctrl.Add_LinkClicked({
-                    $cleanNum = $SoportePhone -replace '[^\d]', ''
-                    Start-Process "https://wa.me/$cleanNum"
-                })
-            } else {
-                $ctrl.Add_LinkClicked({
-                    Start-Process ("mailto:" + $SoporteMail + "?subject=Soporte IT - " + $env:COMPUTERNAME)
-                })
-            }
-        } else {
-            $ctrl = New-Object System.Windows.Forms.Label
-            $ctrl.Text      = $value
-            $ctrl.Font      = New-Object System.Drawing.Font("Segoe UI", 9.5, [System.Drawing.FontStyle]::Regular)
-            $ctrl.ForeColor = [System.Drawing.Color]::FromArgb(30, 30, 30)
-            $ctrl.Location  = New-Object System.Drawing.Point(20, ($script:currentY + 15))
-            $ctrl.AutoSize  = $true
-        }
-        $form.Controls.Add($ctrl)
-
-        $script:currentY += 43
+    $diasText = if ($info.DiasSinReiniciar -eq 0) {
+        "Hoy (menos de 24 hs)"
+    } elseif ($info.DiasSinReiniciar -eq 1) {
+        "1 día"
+    } elseif ($info.DiasSinReiniciar -eq "N/A") {
+        "No disponible"
+    } else {
+        "$($info.DiasSinReiniciar) días"
     }
 
-    Add-Row "Hostname"       $info.HostName
-    Add-Row "Usuario"        $info.Usuario
-    Add-Row "IP Local"       $info.IP
-    Add-Row "IP Pública"     $info.IPPublica
+    $requiereReiniciar = ($info.DiasSinReiniciar -is [int] -and $info.DiasSinReiniciar -ge 7)
+    $uptimeColor = if ($requiereReiniciar) {
+        [System.Drawing.Color]::FromArgb(190, 55, 55)
+    } else {
+        $accentColor
+    }
 
+    $uptimeCard = New-Object System.Windows.Forms.Panel
+    $uptimeCard.Location  = New-Object System.Drawing.Point(18, $currentY)
+    $uptimeCard.Size      = New-Object System.Drawing.Size(344, 70)
+    $uptimeCard.BackColor = $cardColor
+
+    $uptimeAccent = New-Object System.Windows.Forms.Panel
+    $uptimeAccent.Location  = New-Object System.Drawing.Point(0, 0)
+    $uptimeAccent.Size      = New-Object System.Drawing.Size(4, 70)
+    $uptimeAccent.BackColor = $uptimeColor
+    $uptimeCard.Controls.Add($uptimeAccent)
+
+    $lblUptimeTitle = New-Object System.Windows.Forms.Label
+    $lblUptimeTitle.Text      = "TIEMPO SIN REINICIAR"
+    $lblUptimeTitle.Location  = New-Object System.Drawing.Point(17, 10)
+    $lblUptimeTitle.AutoSize  = $true
+    $lblUptimeTitle.Font      = New-Object System.Drawing.Font("Segoe UI", 8, [System.Drawing.FontStyle]::Bold)
+    $lblUptimeTitle.ForeColor = $mutedColor
+    $uptimeCard.Controls.Add($lblUptimeTitle)
+
+    $lblUptimeValue = New-Object System.Windows.Forms.Label
+    $lblUptimeValue.Text      = $diasText
+    $lblUptimeValue.Location  = New-Object System.Drawing.Point(17, 30)
+    $lblUptimeValue.AutoSize  = $true
+    $lblUptimeValue.Font      = New-Object System.Drawing.Font("Segoe UI", 13, [System.Drawing.FontStyle]::Bold)
+    $lblUptimeValue.ForeColor = $uptimeColor
+    $uptimeCard.Controls.Add($lblUptimeValue)
+
+    $lblUptimeHint = New-Object System.Windows.Forms.Label
+    $lblUptimeHint.Text      = if ($requiereReiniciar) { "Se recomienda reiniciar el equipo" } else { "Estado de actividad del equipo" }
+    $lblUptimeHint.Location  = New-Object System.Drawing.Point(175, 34)
+    $lblUptimeHint.Size      = New-Object System.Drawing.Size(158, 30)
+    $lblUptimeHint.Font      = New-Object System.Drawing.Font("Segoe UI", 8)
+    $lblUptimeHint.ForeColor = $mutedColor
+    $lblUptimeHint.TextAlign = [System.Drawing.ContentAlignment]::MiddleRight
+    $uptimeCard.Controls.Add($lblUptimeHint)
+    $form.Controls.Add($uptimeCard)
+
+    $currentY += 84
+    $lblDeviceSection = New-Object System.Windows.Forms.Label
+    $lblDeviceSection.Text      = "DISPOSITIVO"
+    $lblDeviceSection.Location  = New-Object System.Drawing.Point(19, $currentY)
+    $lblDeviceSection.AutoSize  = $true
+    $lblDeviceSection.Font      = New-Object System.Drawing.Font("Segoe UI", 8, [System.Drawing.FontStyle]::Bold)
+    $lblDeviceSection.ForeColor = $mutedColor
+    $form.Controls.Add($lblDeviceSection)
+    $currentY += 20
+
+    $deviceItems = @(
+        @{ Label = "NOMBRE DEL EQUIPO"; Value = $info.HostName }
+        @{ Label = "USUARIO"; Value = $info.Usuario }
+        @{ Label = "IP LOCAL"; Value = $info.IP }
+        @{ Label = "IP PÚBLICA"; Value = $info.IPPublica }
+    )
     if ($info.TeamViewerID -ne "No instalado") {
-        Add-Row "ID TeamViewer" $info.TeamViewerID
+        $deviceItems += @{ Label = "TEAMVIEWER ID"; Value = $info.TeamViewerID }
     }
 
-    Add-Row "Teléfono / WhatsApp" $SoportePhone $true $true
-    Add-Row "Correo Electrónico" $SoporteMail $true $false
+    $tileWidth = 167
+    $tileHeight = 62
+    $tileGap = 10
+    for ($i = 0; $i -lt $deviceItems.Count; $i++) {
+        $column = $i % 2
+        $row = [math]::Floor($i / 2)
+        $tile = New-Object System.Windows.Forms.Panel
+        $tile.Location  = New-Object System.Drawing.Point((18 + ($column * ($tileWidth + $tileGap))), ($currentY + ($row * ($tileHeight + $tileGap))))
+        $tile.Size      = New-Object System.Drawing.Size($tileWidth, $tileHeight)
+        $tile.BackColor = $cardColor
 
-    # Separador
-    $sep = New-Object System.Windows.Forms.Panel
-    $sep.Size      = New-Object System.Drawing.Size(280, 1)
-    $sep.Location  = New-Object System.Drawing.Point(20, ($script:currentY + 2))
-    $sep.BackColor = [System.Drawing.Color]::FromArgb(220, 220, 220)
-    $form.Controls.Add($sep)
+        $tileLabel = New-Object System.Windows.Forms.Label
+        $tileLabel.Text      = $deviceItems[$i].Label
+        $tileLabel.Location  = New-Object System.Drawing.Point(11, 8)
+        $tileLabel.AutoSize  = $true
+        $tileLabel.Font      = New-Object System.Drawing.Font("Segoe UI", 7.5, [System.Drawing.FontStyle]::Bold)
+        $tileLabel.ForeColor = $mutedColor
+        $tile.Controls.Add($tileLabel)
 
-    # Firma de Autor
+        $tileValue = New-Object System.Windows.Forms.Label
+        $tileValue.Text      = [string]$deviceItems[$i].Value
+        $tileValue.Location  = New-Object System.Drawing.Point(11, 28)
+        $tileValue.Size      = New-Object System.Drawing.Size(($tileWidth - 20), 25)
+        $tileValue.AutoEllipsis = $true
+        $tileValue.Font      = New-Object System.Drawing.Font("Segoe UI", 9.5, [System.Drawing.FontStyle]::Bold)
+        $tileValue.ForeColor = $textColor
+        $tile.Controls.Add($tileValue)
+        $form.Controls.Add($tile)
+    }
+
+    $deviceRows = [math]::Ceiling($deviceItems.Count / 2.0)
+    $currentY += ($deviceRows * ($tileHeight + $tileGap)) - $tileGap + 14
+
+    $lblSupportSection = New-Object System.Windows.Forms.Label
+    $lblSupportSection.Text      = "CONTACTO DE SOPORTE"
+    $lblSupportSection.Location  = New-Object System.Drawing.Point(19, $currentY)
+    $lblSupportSection.AutoSize  = $true
+    $lblSupportSection.Font      = New-Object System.Drawing.Font("Segoe UI", 8, [System.Drawing.FontStyle]::Bold)
+    $lblSupportSection.ForeColor = $mutedColor
+    $form.Controls.Add($lblSupportSection)
+    $currentY += 19
+
+    $supportCard = New-Object System.Windows.Forms.Panel
+    $supportCard.Location  = New-Object System.Drawing.Point(18, $currentY)
+    $supportCard.Size      = New-Object System.Drawing.Size(344, 58)
+    $supportCard.BackColor = $cardColor
+
+    $btnWhatsApp = New-Object System.Windows.Forms.Button
+    $btnWhatsApp.Text      = "WhatsApp  ·  $SoportePhone"
+    $btnWhatsApp.Location  = New-Object System.Drawing.Point(8, 7)
+    $btnWhatsApp.Size      = New-Object System.Drawing.Size(328, 22)
+    $btnWhatsApp.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+    $btnWhatsApp.FlatAppearance.BorderSize = 0
+    $btnWhatsApp.BackColor = $cardColor
+    $btnWhatsApp.ForeColor = $accentColor
+    $btnWhatsApp.TextAlign = [System.Drawing.ContentAlignment]::MiddleLeft
+    $btnWhatsApp.Font      = New-Object System.Drawing.Font("Segoe UI", 8.5)
+    $btnWhatsApp.Cursor    = [System.Windows.Forms.Cursors]::Hand
+    $btnWhatsApp.Add_Click({
+        $cleanNum = $SoportePhone -replace '[^\d]', ''
+        Start-Process "https://wa.me/$cleanNum"
+    })
+    $supportCard.Controls.Add($btnWhatsApp)
+
+    $btnEmail = New-Object System.Windows.Forms.Button
+    $btnEmail.Text      = "Correo  ·  $SoporteMail"
+    $btnEmail.Location  = New-Object System.Drawing.Point(8, 30)
+    $btnEmail.Size      = New-Object System.Drawing.Size(328, 22)
+    $btnEmail.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+    $btnEmail.FlatAppearance.BorderSize = 0
+    $btnEmail.BackColor = $cardColor
+    $btnEmail.ForeColor = $accentColor
+    $btnEmail.TextAlign = [System.Drawing.ContentAlignment]::MiddleLeft
+    $btnEmail.Font      = New-Object System.Drawing.Font("Segoe UI", 8.5)
+    $btnEmail.Cursor    = [System.Windows.Forms.Cursors]::Hand
+    $btnEmail.Add_Click({
+        Start-Process ("mailto:" + $SoporteMail + "?subject=Soporte IT - " + $env:COMPUTERNAME)
+    })
+    $supportCard.Controls.Add($btnEmail)
+    $form.Controls.Add($supportCard)
+    $currentY += 70
+
     $lblAuthor = New-Object System.Windows.Forms.Label
     $lblAuthor.Text      = "Desarrollado por Martin Chambilla"
-    $lblAuthor.Font      = New-Object System.Drawing.Font("Segoe UI", 7.5, [System.Drawing.FontStyle]::Italic)
-    $lblAuthor.ForeColor = [System.Drawing.Color]::FromArgb(150, 150, 150)
-    $lblAuthor.Location  = New-Object System.Drawing.Point(20, ($script:currentY + 6))
+    $lblAuthor.Font      = New-Object System.Drawing.Font("Segoe UI", 7.5)
+    $lblAuthor.ForeColor = $mutedColor
+    $lblAuthor.Location  = New-Object System.Drawing.Point(19, $currentY)
     $lblAuthor.AutoSize  = $true
     $form.Controls.Add($lblAuthor)
 
-    # Botón Cerrar
     $btnCerrar = New-Object System.Windows.Forms.Button
     $btnCerrar.Text      = "Cerrar"
-    $btnCerrar.Size      = New-Object System.Drawing.Size(270, 30)
-    $btnCerrar.Location  = New-Object System.Drawing.Point(20, ($script:currentY + 26))
+    $btnCerrar.Size      = New-Object System.Drawing.Size(72, 28)
+    $btnCerrar.Location  = New-Object System.Drawing.Point(290, ($currentY - 6))
     $btnCerrar.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
     $btnCerrar.BackColor = $ColorHeader
     $btnCerrar.ForeColor = [System.Drawing.Color]::White
-    $btnCerrar.Font      = New-Object System.Drawing.Font("Segoe UI", 9, [System.Drawing.FontStyle]::Bold)
+    $btnCerrar.Font      = New-Object System.Drawing.Font("Segoe UI", 8.5, [System.Drawing.FontStyle]::Bold)
     $btnCerrar.FlatAppearance.BorderSize = 0
     $btnCerrar.Add_Click({ $form.Close() })
     $form.Controls.Add($btnCerrar)
 
-    $form.ClientSize = New-Object System.Drawing.Size(320, ($script:currentY + 66))
-    
+    $form.ClientSize = New-Object System.Drawing.Size(380, ($currentY + 32))
     $form.Location = New-Object System.Drawing.Point(
-        ($screen.Right  - $form.Width  - 10),
-        ($screen.Bottom - $form.Height - 10)
+        [math]::Max($screen.Left + 10, ($screen.Right - $form.Width - 10)),
+        [math]::Max($screen.Top + 10, ($screen.Bottom - $form.Height - 10))
     )
 
     $form.Add_Deactivate({ $form.Close() })
