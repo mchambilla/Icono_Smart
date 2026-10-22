@@ -14,11 +14,12 @@ $SoporteMail  = "ayuda@smartsouth.net"
 $SoportePhone = "+54 9 11 6794-7386"
 $AppTitle     = "Smart South - Soporte IT"
 $ColorHeader  = [System.Drawing.Color]::FromArgb(24, 81, 163)
-$IconPath     = "C:\SmartSouth\logo.ico"
-$PngPath      = "C:\SmartSouth\logo.png"
+$IconPath     = Join-Path $PSScriptRoot "Logo.ico"
+$PngPath      = Join-Path $PSScriptRoot "Logo.png"
 $GlpiService  = "glpi-agent"
 $GracePeriodDays = 15
 $MonitorTaskPrefix = "SmartSouthTray GLPI Agent Monitor"
+$StartupTaskPrefix = "SmartSouthTray Startup"
 # ─────────────────────────────────────────────────────────────────────────────
 
 function Get-ManagedAppRoot {
@@ -42,6 +43,11 @@ function Get-ManagedAppRoot {
 function Get-MonitorTaskName {
     $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
     return "$MonitorTaskPrefix - $($identity.User.Value)"
+}
+
+function Get-StartupTaskName {
+    $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+    return "$StartupTaskPrefix - $($identity.User.Value)"
 }
 
 function Write-MonitorLog {
@@ -80,6 +86,24 @@ function Register-MonitorTask {
         -Principal $principal `
         -Settings $settings `
         -Description "Controla el servicio GLPI-Agent y la vigencia de SmartSouthTray." `
+        -Force `
+        -ErrorAction Stop | Out-Null
+
+    $startupAction = New-ScheduledTaskAction `
+        -Execute $powershellPath `
+        -Argument "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$scriptPath`""
+    $startupSettings = New-ScheduledTaskSettingsSet `
+        -ExecutionTimeLimit ([TimeSpan]::Zero) `
+        -MultipleInstances IgnoreNew `
+        -StartWhenAvailable
+
+    Register-ScheduledTask `
+        -TaskName (Get-StartupTaskName) `
+        -Action $startupAction `
+        -Trigger $trigger `
+        -Principal $principal `
+        -Settings $startupSettings `
+        -Description "Inicia SmartSouthTray al iniciar sesión." `
         -Force `
         -ErrorAction Stop | Out-Null
 
@@ -152,7 +176,12 @@ function Uninstall-SmartSouthTray {
         Stop-Process -Id $process.ProcessId -Force -ErrorAction Stop
     }
 
-    Unregister-ScheduledTask -TaskName (Get-MonitorTaskName) -Confirm:$false -ErrorAction Stop
+    foreach ($taskName in @((Get-MonitorTaskName), (Get-StartupTaskName))) {
+        $task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+        if ($task) {
+            Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction Stop
+        }
+    }
     Remove-Item -LiteralPath $script:ManagedAppRoot -Recurse -Force -ErrorAction Stop
 }
 
@@ -238,8 +267,8 @@ try {
     Register-MonitorTask
 } catch {
     [System.Windows.Forms.MessageBox]::Show(
-        "No se pudo activar el control de GLPI-Agent. SmartSouthTray continuará abierto, pero no podrá aplicar la desinstalación automática.`r`n`r`n$($_.Exception.Message)",
-        "Smart South - Control de soporte",
+        "No se pudieron configurar correctamente las tareas de inicio y control de GLPI-Agent. SmartSouthTray continuará abierto, pero podría no iniciarse automáticamente ni aplicar la desinstalación automática.`r`n`r`n$($_.Exception.Message)",
+        "Smart South - Configuración",
         [System.Windows.Forms.MessageBoxButtons]::OK,
         [System.Windows.Forms.MessageBoxIcon]::Warning
     ) | Out-Null
@@ -250,16 +279,45 @@ function Get-SmartIcon {
     if (Test-Path $IconPath) {
         return New-Object System.Drawing.Icon($IconPath)
     } elseif (Test-Path $PngPath) {
-        $bmp = [System.Drawing.Bitmap]::FromFile($PngPath)
+        $source = [System.Drawing.Bitmap]::FromFile($PngPath)
+        try {
+            for ($y = 0; $y -lt $source.Height; $y++) {
+                for ($x = 0; $x -lt $source.Width; $x++) {
+                    $pixel = $source.GetPixel($x, $y)
+                    $isDarkBackground = ($pixel.R -lt 80 -and $pixel.G -lt 60 -and $pixel.B -lt 100)
+                    $isWhiteBackground = ($pixel.R -gt 220 -and $pixel.G -gt 220 -and $pixel.B -gt 220)
+                    if ($isDarkBackground -or $isWhiteBackground) {
+                        $source.SetPixel($x, $y, [System.Drawing.Color]::Transparent)
+                    }
+                }
+            }
+
+            $bmp = New-Object System.Drawing.Bitmap 32, 32
+            $graphics = [System.Drawing.Graphics]::FromImage($bmp)
+            try {
+                $graphics.Clear([System.Drawing.Color]::Transparent)
+                $graphics.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+                $graphics.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::HighQuality
+                $graphics.DrawImage($source, 0, 0, 32, 32)
+            } finally {
+                $graphics.Dispose()
+            }
+        } finally {
+            $source.Dispose()
+        }
+
         $hIcon = $bmp.GetHicon()
+        $bmp.Dispose()
         return [System.Drawing.Icon]::FromHandle($hIcon)
     } else {
-        $bmp = New-Object System.Drawing.Bitmap 16, 16
+        $bmp = New-Object System.Drawing.Bitmap 32, 32
         $g   = [System.Drawing.Graphics]::FromImage($bmp)
-        $brush = New-Object System.Drawing.SolidBrush ($ColorHeader)
-        $g.FillEllipse($brush, 0, 0, 15, 15)
+        $brush = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(245, 145, 0))
+        $g.FillEllipse($brush, 1, 1, 30, 30)
         $g.Dispose()
-        return [System.Drawing.Icon]::FromHandle($bmp.GetHicon())
+        $hIcon = $bmp.GetHicon()
+        $bmp.Dispose()
+        return [System.Drawing.Icon]::FromHandle($hIcon)
     }
 }
 
