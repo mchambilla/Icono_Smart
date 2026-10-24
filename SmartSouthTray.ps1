@@ -20,6 +20,7 @@ $GlpiService  = "glpi-agent"
 $GracePeriodDays = 15
 $MonitorTaskPrefix = "SmartSouthTray GLPI Agent Monitor"
 $StartupTaskPrefix = "SmartSouthTray Startup"
+$StartupRunValueName = "SmartSouthTray"
 # ─────────────────────────────────────────────────────────────────────────────
 
 function Get-ManagedAppRoot {
@@ -48,6 +49,29 @@ function Get-MonitorTaskName {
 function Get-StartupTaskName {
     $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
     return "$StartupTaskPrefix - $($identity.User.Value)"
+}
+
+function Register-StartupEntry {
+    $powershellPath = Join-Path $env:WINDIR "System32\WindowsPowerShell\v1.0\powershell.exe"
+    $scriptPath = Join-Path $PSScriptRoot "SmartSouthTray.ps1"
+    $runKeyPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
+    $arguments = "-NoLogo -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$scriptPath`""
+    $command = "`"$powershellPath`" $arguments"
+
+    New-Item -Path $runKeyPath -Force -ErrorAction Stop | Out-Null
+    New-ItemProperty `
+        -Path $runKeyPath `
+        -Name $StartupRunValueName `
+        -Value $command `
+        -PropertyType String `
+        -Force `
+        -ErrorAction Stop | Out-Null
+
+    $legacyTaskName = Get-StartupTaskName
+    $legacyTask = Get-ScheduledTask -TaskName $legacyTaskName -ErrorAction SilentlyContinue
+    if ($legacyTask) {
+        Unregister-ScheduledTask -TaskName $legacyTaskName -Confirm:$false -ErrorAction Stop
+    }
 }
 
 function Write-MonitorLog {
@@ -89,23 +113,7 @@ function Register-MonitorTask {
         -Force `
         -ErrorAction Stop | Out-Null
 
-    $startupAction = New-ScheduledTaskAction `
-        -Execute $powershellPath `
-        -Argument "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$scriptPath`""
-    $startupSettings = New-ScheduledTaskSettingsSet `
-        -ExecutionTimeLimit ([TimeSpan]::Zero) `
-        -MultipleInstances IgnoreNew `
-        -StartWhenAvailable
-
-    Register-ScheduledTask `
-        -TaskName (Get-StartupTaskName) `
-        -Action $startupAction `
-        -Trigger $trigger `
-        -Principal $principal `
-        -Settings $startupSettings `
-        -Description "Inicia SmartSouthTray al iniciar sesión." `
-        -Force `
-        -ErrorAction Stop | Out-Null
+    Register-StartupEntry
 
     $task = Get-ScheduledTask -TaskName $taskName -ErrorAction Stop
     if ($task.State -ne "Running") {
@@ -180,6 +188,16 @@ function Uninstall-SmartSouthTray {
         $task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
         if ($task) {
             Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction Stop
+        }
+    }
+    $runKeyPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
+    if (Test-Path -LiteralPath $runKeyPath) {
+        $startupValues = Get-ItemProperty -LiteralPath $runKeyPath -ErrorAction Stop
+        if ($startupValues.PSObject.Properties[$StartupRunValueName]) {
+            Remove-ItemProperty `
+                -LiteralPath $runKeyPath `
+                -Name $StartupRunValueName `
+                -ErrorAction Stop
         }
     }
     Remove-Item -LiteralPath $script:ManagedAppRoot -Recurse -Force -ErrorAction Stop

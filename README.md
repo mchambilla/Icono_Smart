@@ -39,7 +39,7 @@ Las versiones instaladas se conservan en carpetas separadas para no reemplazar a
 
 ## Vigencia según GLPI-Agent
 
-Al iniciar SmartSouthTray, se registran tareas del usuario actual en el Programador de tareas. Una inicia la aplicación al iniciar sesión y la otra comprueba cada hora el servicio de Windows `glpi-agent`, además de hacerlo al iniciar sesión:
+Al iniciar SmartSouthTray, se configura el inicio de la aplicación en la clave `Run` del usuario actual de Windows para que se abra en su sesión de escritorio al iniciar sesión. También se registra una tarea en el Programador de tareas que comprueba cada hora el servicio de Windows `glpi-agent`, además de hacerlo al iniciar sesión:
 
 - Si el servicio está en ejecución, se reinicia el período de gracia.
 - Si está detenido o no está instalado, comienza un período de 15 días.
@@ -47,4 +47,4 @@ Al iniciar SmartSouthTray, se registran tareas del usuario actual en el Programa
 
 La comprobación no requiere privilegios de administrador. Si Windows no permite consultar el estado del servicio, la tarea registra el error y no avanza la desinstalación. Si el equipo está apagado, el plazo transcurre igualmente y se aplica en la siguiente comprobación al volver a iniciar sesión.
 
-El icono se carga desde `Logo.png` incluido junto al script en cada versión instalada. Las tareas y el estado de la política se configuran para la cuenta de Windows que ejecuta SmartSouthTray. La desinstalación elimina los datos de esa cuenta; no elimina el ejecutable bootstrapper si fue guardado en otra ubicación. Tras la baja, un técnico puede volver a ejecutar manualmente `SmartSouthTray.exe` cuando corresponda.
+El icono se carga desde `Logo.png` incluido junto al script en cada versión instalada. El inicio automático y el estado de la política se configuran para la cuenta de Windows que ejecuta SmartSouthTray. La desinstalación elimina los datos de esa cuenta y su configuración de inicio; no elimina el ejecutable bootstrapper si fue guardado en otra ubicación. Tras la baja, un técnico puede volver a ejecutar manualmente `SmartSouthTray.exe` cuando corresponda.
